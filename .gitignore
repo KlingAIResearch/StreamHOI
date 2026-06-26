@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+
+longlive_models
+wan_models
+
+videos
+vis/
+StreamingCode/
+wandb/
+
+.vscode/*
+checkpoints/*
+logs/*
+prompts/*
