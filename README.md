@@ -20,6 +20,12 @@
   </a>
 </p>
 
+## Method Overview
+
+<p align="center">
+    <img src="assets/pipeline.png" width="80%" alt="pipeline">
+</p>
+
 ## Quick Start
 
 1. Create the environment.
