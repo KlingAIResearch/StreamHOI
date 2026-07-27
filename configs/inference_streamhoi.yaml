@@ -1,7 +1,6 @@
 i2v: true
 independent_first_frame: true
 
-# Architecture
 denoising_step_list:
 - 1000
 - 750
@@ -13,22 +12,56 @@ model_kwargs:
   model_name: Wan2.2-TI2V-5B
   local_attn_size: 12
   timestep_shift: 5.0
-  sink_size: 5
-  use_infinite_attention: true
+  sink_size: 4
+  MDS_with_relativeRope: true
 
-# Inference
+whether_set_per_block_sink_size: true
+sink_size_per_block:
+- 7  # block 0
+- 5  # block 1
+- 7  # block 2
+- 7  # block 3
+- 8  # block 4
+- 9  # block 5
+- 7  # block 6
+- 9  # block 7
+- 8  # block 8
+- 9  # block 9
+- 9  # block 10
+- 3  # block 11
+- 8  # block 12
+- 3  # block 13
+- 3  # block 14
+- 3  # block 15
+- 3  # block 16
+- 3  # block 17
+- 2  # block 18
+- 3  # block 19
+- 4  # block 20
+- 3  # block 21
+- 3  # block 22
+- 3  # block 23
+- 3  # block 24
+- 3  # block 25
+- 3  # block 26
+- 4  # block 27
+- 4  # block 28
+- 4  # block 29
+
+learnable_mds: true
+
+# inference
 data_path: ''
 output_folder: ''
 inference_iter: -1
-num_output_frames: 121
+num_output_frames: 161
 use_ema: false
 seed: 0
 num_samples: 1
 save_with_index: true
-switch_frame_indices: 21, 41, 61, 81, 101
-
 global_sink: true
 context_noise: 0
+load_raw_video: true
 
 generator_ckpt: ''
 lora_ckpt: ''
