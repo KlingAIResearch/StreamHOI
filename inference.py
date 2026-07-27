@@ -40,14 +40,8 @@ parser.add_argument("--generator_ckpt", type=str, default=None)
 parser.add_argument("--lora_ckpt", type=str, default=None)
 parser.add_argument("--use_ema", action='store_true')
 parser.add_argument("--num_output_frames", type=int, default=None)
-parser.add_argument("--visualize_sink_attn", action='store_true', help="Visualize sink attention heatmaps")
-parser.add_argument("--visualize_cross_attn", action='store_true', help="Visualize cross attention heatmaps")
-parser.add_argument("--visualize_local_attn", action='store_true', help="Visualize local window attention heatmaps")
-parser.add_argument("--vis_sink_output_dir", type=str, default="vis_sink_attn")
-parser.add_argument("--input_multi_frames", type=int, default=None)
 
 args = parser.parse_args()
-
 
 def is_rank0():
     if dist.is_available() and dist.is_initialized():
@@ -58,14 +52,6 @@ def is_rank0():
 def rank0_print(*args, **kwargs):
     if is_rank0():
         print(*args, **kwargs)
-
-
-# if (not args.use_ema and args.lora_ckpt is None) or (args.use_ema and args.lora_ckpt is not None):
-#     raise ValueError(
-#         "Only two argument combinations are allowed: "
-#         "1) --lora_ckpt is provided and --use_ema is not set; "
-#         "2) --use_ema is set and --lora_ckpt is not provided."
-#     )
 
 if args.num_output_frames is not None and args.num_output_frames <= 0:
     raise ValueError("--num_output_frames must be a positive integer")
@@ -174,6 +160,7 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
 
     # Load LoRA weights (if lora_ckpt is provided)
     lora_ckpt_path = getattr(config, "lora_ckpt", None)
+    _mds_state = None
     if lora_ckpt_path:
         rank0_print(f"Loading LoRA checkpoint from {lora_ckpt_path}")
         lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu", mmap=True)
@@ -183,10 +170,25 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
         else:
             peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)  # type: ignore
         rank0_print("LoRA weights loaded for generator")
+        if isinstance(lora_checkpoint, dict):
+            _mds_state = lora_checkpoint.get("generator_mds", None)
     else:
         rank0_print("No LoRA checkpoint specified; using base weights with LoRA adapters initialized")
 
     pipeline.is_lora_enabled = True
+
+    # ---- Learnable Memory Distance Scaling (MDS) ----
+    if bool(getattr(config, "learnable_mds", False)):
+        gen_model = pipeline.generator.model
+        base_model = gen_model.get_base_model() if hasattr(gen_model, "get_base_model") else gen_model
+        if _mds_state:
+            base_model.load_learnable_mds_from_state(_mds_state)
+        else:
+            rank0_print("[MDS] WARNING: learnable_mds=true but no generator_mds found in the "
+                        "lora checkpoint; MDS will be inactive (all lambda=1.0).")
+            for _blk in base_model.blocks:
+                _blk.self_attn.mds_rho = None
+                _blk.self_attn.temporal_scale = 1.0
 
 # Move pipeline to appropriate dtype and device
 rank0_print(f"dtype {pipeline.generator.model.dtype} -> torch.bfloat16")
@@ -196,20 +198,16 @@ if low_memory:
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
-# extended_prompt_path = config.data_path
-# dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
-if 'image' in config.data_path:
-    dataset = ImageDataset(
-        csv_path=config.data_path,
-        height=1280,
-        width=704,
-        image_col="path",
-        prompt_col="caption",
-        center_crop=True,
-        random_flip=False,
-    )
-else:
-    dataset = I2VDataset(csv_path=config.data_path, height=1280, width=704)
+
+dataset = ImageDataset(
+    csv_path=config.data_path,
+    height=1280,
+    width=704,
+    image_col="path",
+    prompt_col="caption",
+    center_crop=True,
+    random_flip=False,
+)
 
 rank0_print(f"Number of prompts: {len(dataset)}")
 
@@ -248,22 +246,6 @@ def build_output_path(output_folder, save_with_index, idx, prompt, seed_idx, pip
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
 
-    SELECTED_VIDEOS = {
-        "6670732_resize1080p_scene-0.mp4",
-        "6645588_resize1080p_scene-2.mp4",
-        "4705874_resize1080p_scene-0.mp4",
-        "8134932_resize1080p_scene-3.mp4",
-        "5973232_resize1080p_scene-1.mp4",
-        "8655657_resize1080p_scene-3.mp4",
-        "7943322_resize1080p_scene-2.mp4",
-        "9780881_resize1080p_scene-1.mp4",
-    }
-    video_path = batch_data.get("video_path", [""])[0] if isinstance(batch_data, dict) else ""
-    if os.path.basename(video_path) not in SELECTED_VIDEOS:
-        continue
-
-    # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
-    # Unpack the batch data for convenience
     if isinstance(batch_data, dict):
         batch = batch_data
     elif isinstance(batch_data, list):
@@ -272,7 +254,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     all_video = []
     num_generated_frames = 0  # Number of generated (latent) frames
 
-    # For text-to-video, batch is just the text prompt
     prompt = batch['prompts'][0]
     extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
     if extended_prompt is not None:
@@ -282,26 +263,13 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     print(f"[RANK {rank}] prompts: ", prompts)
 
     initial_latent = None
-    sink_frames_rgb = None
     if config.i2v:
-        # assert config.num_frame_per_block == 1, "Current I2V only supports the frame-wise model."
-        # For image-to-video, batch contains image and caption
         frames = batch["frames"].to(device=device, dtype=torch.bfloat16)
-        if 'image' in config.data_path:
-            frames_vae_input = frames.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
-        else:
-            frames_vae_input = frames.permute(0, 2, 1, 3, 4).contiguous()
-        print('frames.shape:', frames.shape)
+        frames_vae_input = frames.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
         with torch.no_grad():
             clean_latent = pipeline.vae.encode_to_latent(
                 frames_vae_input).to(device=device, dtype=torch.bfloat16)
-        if args.input_multi_frames is not None:
-            initial_latent = clean_latent[:, :args.input_multi_frames, ]
-        else:
             initial_latent = clean_latent[:, 0:1, ]
-        if args.visualize_sink_attn:
-            # frames: (B, T, C, H, W), take first frame of first sample as sink reference
-            sink_frames_rgb = batch["frames"][0, 0:1].cpu()  # (1, C, H, W)
 
     output_paths = [
         build_output_path(config.output_folder, config.save_with_index, idx, prompt, seed_idx, pipeline, config)
@@ -317,8 +285,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         [config.num_samples, config.num_output_frames - 1, *latent_spatial_shape], device=device, dtype=torch.bfloat16
     )
 
-    vis_output_dir_per_sample = os.path.join(args.vis_sink_output_dir, f"{int(idx):04d}") if (args.visualize_sink_attn or args.visualize_cross_attn or args.visualize_local_attn) else args.vis_sink_output_dir
-
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -326,11 +292,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         low_memory=low_memory,
         profile=False,
         initial_latent=initial_latent,
-        visualize_sink_attn=args.visualize_sink_attn,
-        visualize_cross_attn=args.visualize_cross_attn,
-        visualize_local_attn=args.visualize_local_attn,
-        vis_output_dir=vis_output_dir_per_sample,
-        sink_frames_rgb=sink_frames_rgb,
     )
 
     if isinstance(video, VideoPath):
