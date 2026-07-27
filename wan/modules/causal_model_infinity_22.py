@@ -21,23 +21,6 @@ from utils.global_config import get_seq_frame_len
 
 from utils.debug_option import DEBUG
 
-# Global buffer for sink attention scores visualization
-# Each entry: dict {chunk_id, denoise_step_id, block_id, score: [B, num_query_tokens, num_sink_tokens]}
-SINK_ATTN_SCORE_BUFFER = []
-SINK_ATTN_VIS_ENABLED = False
-SINK_ATTN_CURRENT_CHUNK_ID = 0
-SINK_ATTN_CURRENT_STEP_ID = 0
-SINK_ATTN_CURRENT_BLOCK_ID = 0
-SINK_ATTN_IS_DENOISING = False
-
-CROSS_ATTN_SCORE_BUFFER = []
-CROSS_ATTN_VIS_ENABLED = False
-CROSS_ATTN_CURRENT_BLOCK_ID = 0
-
-LOCAL_ATTN_SCORE_BUFFER = []
-LOCAL_ATTN_VIS_ENABLED = False
-LOCAL_ATTN_CURRENT_BLOCK_ID = 0
-
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
@@ -80,13 +63,21 @@ def block_relativistic_rope(x, grid_sizes, freqs, start_frame=0, relative_frame_
         if relative_frame_indices is not None:
             # relative_frame_indices should be a tensor of shape [f] with explicit frame indices
             frame_indices = relative_frame_indices.long()
+        else:
+            frame_indices = torch.arange(start_frame, start_frame + f, device=freqs[0].device)
+
+        if temporal_scale == 1.0:
             freqs_temporal = freqs[0][frame_indices].view(f, 1, 1, -1).expand(f, h, w, -1)
         else:
-            freqs_temporal = freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1)
+            # Paper MDS: rescale the temporal RoPE *frequency* (omega_tilde = lambda * omega),
+            # i.e. exp(i * lambda * omega * tau) -- NOT a magnitude scaling of the unit-modulus
+            # phasor. Recover the per-channel angular frequency from the table (phase at position 1,
+            # omega in (0, 1] rad so it is wrap-free) and evaluate the rotation at the scaled phase.
+            omega = torch.angle(freqs[0][1])
+            positions = frame_indices.to(omega.dtype)
+            phase = temporal_scale * positions[:, None] * omega[None, :]
+            freqs_temporal = torch.polar(torch.ones_like(phase), phase).view(f, 1, 1, -1).expand(f, h, w, -1)
 
-        if temporal_scale != 1.0:
-            freqs_temporal = freqs_temporal * temporal_scale
-        
         freqs_i = torch.cat([
             freqs_temporal,
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -122,6 +113,9 @@ class CausalWanSelfAttention(nn.Module):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.temporal_scale = temporal_scale
+        # Learnable MDS parameter rho (lambda = sigmoid(rho)); created only for HOI-biased blocks
+        # via CausalWanModel22.enable_learnable_mds(). None -> fixed self.temporal_scale.
+        self.mds_rho = None
         self.qk_norm = qk_norm
         self.eps = eps
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
@@ -251,6 +245,7 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             num_new_frames = grid_sizes[0][0].item()  # F from grid_sizes
+            eff_scale = torch.sigmoid(self.mds_rho) if self.mds_rho is not None else self.temporal_scale
             
             current_end = current_start + q.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
@@ -305,7 +300,7 @@ class CausalWanSelfAttention(nn.Module):
                 )
                 roped_query = block_relativistic_rope(
                     q, grid_sizes, freqs, relative_frame_indices=query_relative_indices,
-                    temporal_scale=self.temporal_scale
+                    temporal_scale=eff_scale
                 ).type_as(v)
 
                 # For cached K: apply RoPE dynamically based on current position in window
@@ -322,7 +317,7 @@ class CausalWanSelfAttention(nn.Module):
                 roped_temp_k = block_relativistic_rope(
                     temp_k[:, :local_end_index].view(b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2),
                     cache_grid_sizes, freqs, relative_frame_indices=cache_relative_indices,
-                    temporal_scale=self.temporal_scale
+                    temporal_scale=eff_scale
                 ).type_as(v)
 
                 # Save cache update info for later use - store UN-ROPED K!
@@ -373,7 +368,7 @@ class CausalWanSelfAttention(nn.Module):
                 )
                 roped_query = block_relativistic_rope(
                     q, grid_sizes, freqs, relative_frame_indices=query_relative_indices,
-                    temporal_scale=self.temporal_scale
+                    temporal_scale=eff_scale
                 ).type_as(v)
 
                 # Cached K: apply RoPE dynamically
@@ -386,7 +381,7 @@ class CausalWanSelfAttention(nn.Module):
                 roped_temp_k = block_relativistic_rope(
                     temp_k[:, :local_end_index].view(b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2),
                     cache_grid_sizes, freqs, relative_frame_indices=cache_relative_indices,
-                    temporal_scale=self.temporal_scale
+                    temporal_scale=eff_scale
                 ).type_as(v)
 
                 # Save cache update info - store UN-ROPED K!
@@ -422,40 +417,6 @@ class CausalWanSelfAttention(nn.Module):
                     k_cat,
                     v_cat
                 )
-                if SINK_ATTN_VIS_ENABLED and SINK_ATTN_IS_DENOISING:
-                    import wan.modules.causal_model_infinity_22 as _self_mod
-                    with torch.no_grad():
-                        q_f = roped_query.float()
-                        k_s = k_sink.float()
-                        scale = q_f.shape[-1] ** -0.5
-                        score = torch.einsum('bqnd,bknd->bnqk', q_f * scale, k_s)
-                        score = score.mean(dim=1)
-                        _self_mod.SINK_ATTN_SCORE_BUFFER.append({
-                            "chunk_id": _self_mod.SINK_ATTN_CURRENT_CHUNK_ID,
-                            "denoise_step_id": _self_mod.SINK_ATTN_CURRENT_STEP_ID,
-                            "block_id": _self_mod.SINK_ATTN_CURRENT_BLOCK_ID,
-                            "score": score.cpu(),
-                        })
-                        _self_mod.SINK_ATTN_CURRENT_BLOCK_ID += 1
-                if LOCAL_ATTN_VIS_ENABLED and SINK_ATTN_IS_DENOISING and local_budget > 0:
-                    import wan.modules.causal_model_infinity_22 as _self_mod
-                    with torch.no_grad():
-                        last1_tokens = frame_seqlen
-                        last1_start = max(sink_tokens, local_end_index - last1_tokens)
-                        k_last1 = roped_temp_k[:, last1_start:local_end_index].float()
-                        if k_last1.shape[1] > 0:
-                            q_f = roped_query.float()
-                            scale = q_f.shape[-1] ** -0.5
-                            score_local = torch.einsum('bqnd,bknd->bnqk', q_f * scale, k_last1)
-                            score_local = score_local.mean(dim=1)  # (B, num_query_tokens, last1_tokens)
-                            _self_mod.LOCAL_ATTN_SCORE_BUFFER.append({
-                                "chunk_id": _self_mod.SINK_ATTN_CURRENT_CHUNK_ID,
-                                "denoise_step_id": _self_mod.SINK_ATTN_CURRENT_STEP_ID,
-                                "block_id": _self_mod.LOCAL_ATTN_CURRENT_BLOCK_ID,
-                                "score": score_local.cpu(),
-                                "num_last_frames": k_last1.shape[1] // frame_seqlen,
-                            })
-                            _self_mod.LOCAL_ATTN_CURRENT_BLOCK_ID += 1
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
                 x = attention(
@@ -561,22 +522,6 @@ class CausalWanAttentionBlock(nn.Module):
             x_normed = self.norm3(x)
             cross_out = self.cross_attn(x_normed, context, context_lens, crossattn_cache=crossattn_cache)
             x = x + cross_out
-            if CROSS_ATTN_VIS_ENABLED and SINK_ATTN_IS_DENOISING and crossattn_cache is not None and crossattn_cache.get("is_init", False):
-                import wan.modules.causal_model_infinity_22 as _self_mod
-                with torch.no_grad():
-                    b_v, n_v, d_v = x_normed.shape[0], self.cross_attn.num_heads, self.cross_attn.head_dim
-                    q_v = self.cross_attn.norm_q(self.cross_attn.q(x_normed)).view(b_v, -1, n_v, d_v).float()
-                    k_v = crossattn_cache["k"].float()
-                    scale_v = d_v ** -0.5
-                    score_v = torch.einsum('bqnd,bknd->bnqk', q_v * scale_v, k_v)
-                    score_v = score_v.softmax(dim=-1).mean(dim=1)  # (B, num_query_tokens, text_len)
-                    _self_mod.CROSS_ATTN_SCORE_BUFFER.append({
-                        "chunk_id": _self_mod.SINK_ATTN_CURRENT_CHUNK_ID,
-                        "denoise_step_id": _self_mod.SINK_ATTN_CURRENT_STEP_ID,
-                        "block_id": _self_mod.CROSS_ATTN_CURRENT_BLOCK_ID,
-                        "score": score_v.cpu(),
-                    })
-                    _self_mod.CROSS_ATTN_CURRENT_BLOCK_ID += 1
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -757,6 +702,49 @@ class CausalWanModel22(ModelMixin, ConfigMixin):
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
+
+    def enable_learnable_mds(self, temporal_scale_per_block, verbose=True):
+        """Enable learnable Memory Distance Scaling (MDS).
+
+        For each HOI-biased block (lambda_init != 1.0) register a learnable scalar rho with
+        lambda = sigmoid(rho), initialized so that sigmoid(rho) == lambda_init exactly.
+        Surrounding blocks (lambda_init == 1.0) keep a fixed scale (no parameter). sigmoid()
+        structurally bounds lambda to (0, 1) during training.
+        """
+        created = []
+        for idx, block in enumerate(self.blocks):
+            lam = float(temporal_scale_per_block[idx]) if idx < len(temporal_scale_per_block) else 1.0
+            attn = block.self_attn
+            if lam == 1.0:
+                attn.mds_rho = None
+                attn.temporal_scale = 1.0
+                continue
+            lam = min(max(lam, 1e-4), 1 - 1e-4)
+            rho_init = math.log(lam / (1.0 - lam))  # logit(lambda)
+            attn.mds_rho = nn.Parameter(torch.tensor([rho_init], dtype=torch.float32))
+            created.append((idx, lam))
+        if verbose and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[MDS] learnable rho created on {len(created)} HOI-biased blocks: "
+                  f"{[(i, round(l, 4)) for i, l in created]}")
+        return [i for i, _ in created]
+
+    def load_learnable_mds_from_state(self, mds_state, verbose=True):
+        import re
+        for block in self.blocks:
+            block.self_attn.mds_rho = None
+            block.self_attn.temporal_scale = 1.0
+        loaded = []
+        for k, v in mds_state.items():
+            m = re.search(r"blocks\.(\d+)\.self_attn\.mds_rho", k)
+            if m is None:
+                continue
+            idx = int(m.group(1))
+            attn = self.blocks[idx].self_attn
+            attn.mds_rho = nn.Parameter(v.detach().clone().float().view(1))
+            loaded.append((idx, torch.sigmoid(attn.mds_rho).item()))
+        if verbose and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[MDS] loaded rho from checkpoint on {len(loaded)} blocks (lambda): {loaded}")
+        return [i for i, _ in loaded]
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(

@@ -508,22 +508,14 @@ class WanModel22(ModelMixin, ConfigMixin):
         # # assert e.dtype == torch.float32 and e0.dtype == torch.float32
         
         # time embeddings
-        # 支持两种输入形状：
-        # - [B]: 所有 token 共享相同时间步
-        # - [B, F]: 每个帧有独立时间步，同一帧内所有 token 共享该帧的时间步
         if t.dim() == 1:
-            # 原逻辑：将标量时间步扩展到所有 token
             t = t.expand(t.size(0), seq_len)
         elif t.dim() == 2:
-            # 新逻辑：t 形状为 [B, F]，需扩展到 [B, seq_len]
-            # 从 grid_sizes 获取每帧的 token 数（假设 batch 内所有样本的 F, H, W 相同）
-            f, h, w = grid_sizes[0].tolist()  # 取第一个样本
-            assert t.size(1) == f, f"t.shape[1] ({t.size(1)}) 与 grid_sizes 中的帧数 ({f}) 不匹配"
+            f, h, w = grid_sizes[0].tolist()
+            assert t.size(1) == f, f"t.shape[1] ({t.size(1)}) does not match frame count ({f}) in grid_sizes"
             frame_tokens = h * w
             total_tokens_per_sample = f * frame_tokens
-            # 将每个帧的时间步复制到该帧的所有 token 上
             t_expanded = t.repeat_interleave(frame_tokens, dim=1)  # [B, total_tokens_per_sample]
-            # 若 seq_len 大于实际 token 数（由于 padding），则用零填充（padding token 不参与计算，值无关紧要）
             if t_expanded.shape[1] < seq_len:
                 padding = torch.zeros(t.size(0), seq_len - t_expanded.shape[1], device=t.device, dtype=t.dtype)
                 t_expanded = torch.cat([t_expanded, padding], dim=1)

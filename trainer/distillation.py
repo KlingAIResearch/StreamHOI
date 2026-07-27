@@ -239,6 +239,21 @@ class Trainer:
                 if self.is_main_process:
                     print("No LoRA checkpoint to load, starting from scratch")
 
+        # ---- Learnable Memory Distance Scaling (MDS) ----
+        self.learnable_mds = bool(getattr(config, "learnable_mds", False))
+        if self.learnable_mds:
+            ts_per_block = list(getattr(config, "temporal_scale_per_block", []))
+            gen_model = self.model.generator.model
+            base_model = gen_model.get_base_model() if hasattr(gen_model, "get_base_model") else gen_model
+            base_model.enable_learnable_mds(ts_per_block)
+            n_rho = 0
+            for name, p in self.model.generator.named_parameters():
+                if name.endswith("mds_rho"):
+                    p.requires_grad_(True)
+                    n_rho += 1
+            if self.is_main_process:
+                print(f"[MDS] learnable_mds enabled: {n_rho} rho params set trainable (base stays frozen)")
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -269,12 +284,7 @@ class Trainer:
         )
         self.model.vae = self.model.vae.to(
             device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
-
-        # if not config.no_visualize or config.load_raw_video:
-        #     print("Moving vae to device 2, self.device: ", self.device)
-        #     self.model.vae = self.model.vae.to(
-        #         device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
-
+        
         # Step 3: Set up EMA parameter containers
         rename_param = (
             lambda name: name.replace("_fsdp_wrapped_module.", "")
@@ -685,8 +695,14 @@ class Trainer:
             state_dict = {
                 "generator_lora": gen_lora_sd,
                 "critic_lora": crit_lora_sd,
-                "step": self.step,
             }
+            # Save learnable MDS scalars in the SAME model.pt under a separate key (NOT inside
+            # generator_lora, since those go through peft.set_peft_model_state_dict which only
+            # understands LoRA-named keys). rho is not a base weight nor a LoRA weight.
+            if getattr(self, "learnable_mds", False):
+                state_dict["generator_mds"] = self._gather_mds_state_dict(self.model.generator)
+                if self.is_main_process:
+                    print(f"[MDS] saved {len(state_dict['generator_mds'])} rho params into checkpoint")
         else:
             with FSDP.state_dict_type(
                 self.model.generator,
@@ -1130,71 +1146,6 @@ class Trainer:
         self.kv_cache_after_critic_rollout = None
         self.kv_cache_after_critic_backward = None
 
-        # ---- DEBUG: generate chunks and save as video to diagnose color saturation bug ----
-        if self.step == 0:
-            try:
-                import os
-                import numpy as np
-                from torchvision.io import write_video
-                _rank = dist.get_rank() if dist.is_initialized() else 0
-                debug_save_dir = os.path.join("vis", "debug_240frames_chunk_20")
-                os.makedirs(debug_save_dir, exist_ok=True)
-
-                all_new_latents = []
-                all_full_latents = []
-                chunk_idx = 0
-                generated_new_so_far = 0
-                target_new_frames = 240
-
-                while self.streaming_model.can_generate_more() and generated_new_so_far < target_new_frames:
-                    print(f"[DEBUG-240 rank{_rank}] generating chunk {chunk_idx + 1}, current_length={self.streaming_model.state['current_length']}...")
-                    with torch.no_grad():
-                        _chunk, _info = self.streaming_model.generate_next_chunk(requires_grad=False)
-                    new_f = _info["new_frames_generated"]
-                    overlap_f = _info["overlap_frames_used"]
-                    all_full_latents.append(_chunk.detach().cpu())
-                    new_latents = _chunk[:, overlap_f:overlap_f + new_f]
-                    all_new_latents.append(new_latents.detach().cpu())
-                    generated_new_so_far += new_f
-                    chunk_idx += 1
-                    print(f"[DEBUG-240 rank{_rank}] chunk {chunk_idx} done: overlap={overlap_f}, new={new_f}, chunk_shape={_chunk.shape}, total_new={generated_new_so_far}")
-
-                def save_latents_as_video(latent_cpu, path, fps=16):
-                    lat = latent_cpu.to(self.device).to(self.model.dtype)
-                    with torch.no_grad():
-                        pix = self.model.vae.decode_to_pixel(lat)
-                    pix = pix.float().clamp(-1, 1)
-                    vid_np = ((pix[0].cpu().numpy() + 1) / 2 * 255).astype("uint8")
-                    vid_np = vid_np.transpose(0, 2, 3, 1)
-                    write_video(path, torch.from_numpy(vid_np), fps=fps)
-                    print(f"[DEBUG-240 rank{_rank}] Saved {vid_np.shape[0]} frames -> {path}")
-
-                if all_new_latents:
-                    print('save all_new_latents')
-                    initial_lat = self.streaming_model.state.get("initial_latent_for_loss")
-                    new_latents_cat = torch.cat(all_new_latents, dim=1)
-                    if initial_lat is not None:
-                        new_latents_cat = torch.cat([initial_lat.cpu(), new_latents_cat], dim=1)
-                    save_latents_as_video(
-                        new_latents_cat,
-                        os.path.join(debug_save_dir, f"rank{_rank:02d}_debug_new_only.mp4"),
-                    )
-                print('save each full_latents')
-                for ci, full_lat in enumerate(all_full_latents):
-                    save_latents_as_video(
-                        full_lat,
-                        os.path.join(debug_save_dir, f"rank{_rank:02d}_chunk{ci:02d}_full21.mp4"),
-                    )
-
-            except Exception as _e:
-                print(f"[DEBUG-240 rank{_rank}] Exception during debug generation: {_e}")
-                import traceback
-                traceback.print_exc()
-            finally:
-                self.streaming_active = False
-                self.start_new_sequence()
-        # ---- END DEBUG ----
-
         if train_generator:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] Training generator: generating next chunk")
@@ -1210,7 +1161,7 @@ class Trainer:
                             print(f"[SeqTrain-Trainer] sink_size switched to {target_sink_size} after first chunk")
                     self._sink_activated = True
             else:
-                #不走这个分支
+                # unused branch
                 current_seq_length = self.streaming_model.state.get("current_length")
                 if current_seq_length == 0:
                     if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1263,7 +1214,7 @@ class Trainer:
                             print(f"[SeqTrain-Trainer] sink_size switched to {target_sink_size} after first chunk (critic)")
                     self._sink_activated = True
             else:
-                #不走这个分支
+                # unused branch
                 current_seq_length = self.streaming_model.state.get("current_length")
                 if current_seq_length == 0:
                     if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1578,6 +1529,16 @@ class Trainer:
         ):
             full = lora_model.state_dict()
         return get_peft_model_state_dict(lora_model, state_dict=full)
+
+    def _gather_mds_state_dict(self, fsdp_model):
+        "On rank-0, gather FULL_STATE_DICT and keep only the learnable MDS rho scalars."
+        with FSDP.state_dict_type(
+            fsdp_model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+        ):
+            full = fsdp_model.state_dict()
+        return {k: v.detach().cpu() for k, v in full.items() if k.endswith("mds_rho")}
     
     # --------------------------------------------------------------------------------------------------------------
     # Visualization helpers

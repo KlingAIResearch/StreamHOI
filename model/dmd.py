@@ -183,7 +183,6 @@ class DMD(SelfForcingModel):
 
             if self.independent_first_frame:
                 timestep[:, 0] = 0
-            print('timestep: ',timestep)
 
             noise = torch.randn_like(image_or_video)
             noisy_latent = self.scheduler.add_noise(
@@ -382,7 +381,6 @@ class DMD(SelfForcingModel):
 
         if self.independent_first_frame:
             critic_timestep[:, 0] = 0
-        print('critic_timestep: ',critic_timestep)
 
         critic_noise = torch.randn_like(generated_image)
         noisy_generated_image = self.scheduler.add_noise(

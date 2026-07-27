@@ -11,7 +11,6 @@ from torch import nn
 
 
 class VideoPath:
-    """解码结果已直接写入临时视频文件时的哨兵对象"""
     def __init__(self, path: str):
         self.path = path
 
@@ -35,7 +34,7 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("/m2v_intern/raozejing/StreamingCode/DiffSynth-Studio-1.1.8/models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load("wan_models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
         
@@ -44,7 +43,7 @@ class WanTextEncoder(torch.nn.Module):
             self.text_encoder = self.text_encoder.cuda()
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="/m2v_intern/raozejing/StreamingCode/DiffSynth-Studio-1.1.8/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name="wan_models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -198,12 +197,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             is_causal=False,
             local_attn_size=-1,
             sink_size=0,
-            use_infinite_attention=False
+            MDS_with_relativeRope=False
     ):
         super().__init__()
 
         # if is_causal:
-        #     if use_infinite_attention:
+        #     if MDS_with_relativeRope:
         #         self.model = CausalWanModelInfinity.from_pretrained(
         #             f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         #     else:

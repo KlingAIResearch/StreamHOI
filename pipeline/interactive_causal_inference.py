@@ -330,7 +330,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 del self.crossattn_cache
             torch.cuda.empty_cache()
 
-        # if getattr(self.args.model_kwargs, "use_infinite_attention", False):
+        # if getattr(self.args.model_kwargs, "MDS_with_relativeRope", False):
         #     video = self.vae.decode_to_pixel_chunk(output.to(noise.device), use_cache=False)
         # else:
         #     video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)

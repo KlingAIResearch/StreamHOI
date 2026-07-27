@@ -28,7 +28,7 @@ class Wan22_VAEWrapper(WanVAEWrapper):
             self,
             z_dim=48,
             c_dim=160,
-            vae_pth="/m2v_intern/raozejing/StreamingCode/DiffSynth-Studio-1.1.8/models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+            vae_pth="wan_models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
             dim_mult=[1, 2, 4, 4],
             temperal_downsample=[False, True, True],
         ):
@@ -172,20 +172,19 @@ class Wan22_DiffusionWrapper(WanDiffusionWrapper):
             is_causal=False,
             local_attn_size=-1,
             sink_size=0,
-            use_infinite_attention=False
+            MDS_with_relativeRope=False
     ):
         super().__init__()
 
         if is_causal:
-            if use_infinite_attention:
-                print('use CausalWanModelInfinity22')
+            if MDS_with_relativeRope:
                 self.model = CausalWanModelInfinity22.from_pretrained(
-                    f"/m2v_intern/raozejing/StreamingCode/DiffSynth-Studio-1.1.8/models/Wan-AI/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                    f"wan_models/Wan-AI/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
             else:
                 self.model = CausalWanModel22.from_pretrained(
-                    f"/m2v_intern/raozejing/StreamingCode/DiffSynth-Studio-1.1.8/models/Wan-AI/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                    f"wan_models/Wan-AI/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel22.from_pretrained(f"/m2v_intern/raozejing/StreamingCode/DiffSynth-Studio-1.1.8/models/Wan-AI/{model_name}/")
+            self.model = WanModel22.from_pretrained(f"wan_models/Wan-AI/{model_name}/")
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep

@@ -139,8 +139,8 @@ class I2VDataset(torch.utils.data.Dataset):
         random_flip=False,
         video_col="video",
         prompt_col="caption",
-        num_frames=None,                 # 返回的视频帧数
-        sample_mode="all",         # "uniform" or "head" or "all"
+        num_frames=None,
+        sample_mode="all",
         return_video=True,
         return_image=True,
     ):
@@ -161,8 +161,6 @@ class I2VDataset(torch.utils.data.Dataset):
         self.center_crop = center_crop
         self.random_flip = random_flip
 
-        # 仅做 “crop + flip + toTensor + normalize”
-        # resize 由我们自己做（为了完全复用你现有的 cover-resize 逻辑）
         self.post_processor = transforms.Compose(
             [
                 transforms.CenterCrop((height, width)) if center_crop else transforms.RandomCrop((height, width)),
@@ -176,34 +174,20 @@ class I2VDataset(torch.utils.data.Dataset):
         return len(self.video_paths)
 
     def __getitem__(self, index):
-        # 用 randint + index 做一个“固定 seed 下可复现”的遍历扰动
-        #data_id = torch.randint(0, len(self.video_paths), (1,))[0]
         data_id = (index) % len(self.video_paths)
 
         video_path = self.video_paths[int(data_id)]
-        # if video_path.startswith("/m2v_intern/xuziyi06/"):
-        #     video_path = video_path.replace(
-        #         "/m2v_intern/xuziyi06/",
-        #         "/m2v_intern/raozejing/xuziyi06/"
-        #     )
-        if video_path.startswith("/share/xuziyi/"):
-            video_path = video_path.replace(
-                "/share/xuziyi/",
-                "/share/raozejing/"
-            )
 
         text = self.texts[int(data_id)]
         
 
         out = {"prompts": text, "idx": index, "data_id": int(data_id), "video_path": video_path}
 
-        # 先读视频帧（因为 image 可以直接取首帧，避免重复解码）
+    
         frames_pil = None
         if self.return_video:
             frames_pil = self._read_video_frames(video_path, num_frames=self.num_frames, mode=self.sample_mode)
-            # frames_pil: List[PIL.Image]，每帧 RGB
-
-        # image：如果需要就取首帧；如果已经读了 video，直接用 video 的第 0 帧
+        
         if self.return_image:
             if frames_pil is not None and len(frames_pil) > 0:
                 image = frames_pil[0]
@@ -211,7 +195,6 @@ class I2VDataset(torch.utils.data.Dataset):
                 image = self._read_first_frame(video_path)
             out["images"] = self._process_single_image(image)
 
-        # video：对每一帧做相同 resize + 同一组 crop/flip 逻辑（下面用“参数锁定”保证一致）
         if self.return_video:
             out["frames"] = self._process_video_frames_consistent(frames_pil)
 
@@ -220,7 +203,7 @@ class I2VDataset(torch.utils.data.Dataset):
     # ---------- processing helpers ----------
 
     def _cover_resize_pil(self, image: Image.Image) -> Image.Image:
-        """完全复用你现在的 cover-resize 逻辑：先 resize 到能覆盖目标 H/W，再 crop。"""
+        """Cover-resize then center crop: resize to cover target H/W, then crop."""
         target_height, target_width = self.height, self.width
         w, h = image.size
         scale = max(target_width / w, target_height / h)
@@ -236,34 +219,24 @@ class I2VDataset(torch.utils.data.Dataset):
         return image
 
     def _process_video_frames_consistent(self, frames_pil):
-        """
-        关键点：保证 video 内所有帧用同一组 crop 参数、同一次 flip。
-        - resize：每帧独立做 cover-resize（因为原始帧尺寸相同，效果也一致）
-        - crop：如果是 RandomCrop，需要固定同一个 crop 参数
-        - flip：如果是 RandomHorizontalFlip，需要固定同一次 flip 决策
-        """
         if frames_pil is None or len(frames_pil) == 0:
             raise RuntimeError("Empty video frames")
 
-        # 1) cover-resize 每一帧
         frames_resized = [self._cover_resize_pil(im) for im in frames_pil]
 
-        # 2) 决定 crop 参数（CenterCrop 不需要参数）
         if self.center_crop:
             crop_params = None
         else:
-            # RandomCrop.get_params 返回 (i, j, h, w)
+            # RandomCrop.get_params returns (i, j, h, w)
             i, j, h, w = transforms.RandomCrop.get_params(
                 frames_resized[0], output_size=(self.height, self.width)
             )
             crop_params = (i, j, h, w)
 
-        # 3) 决定 flip（random_flip=True 才可能 flip）
         do_flip = False
         if self.random_flip:
             do_flip = bool(torch.rand(1).item() < 0.5)
 
-        # 4) 对每帧应用同样的 crop/flip + ToTensor + Normalize
         video_t = []
         for im in frames_resized:
             if crop_params is None:
@@ -306,11 +279,11 @@ class I2VDataset(torch.utils.data.Dataset):
     @staticmethod
     def _read_video_frames(video_path: str, num_frames: int = None, mode: str = "uniform"):
         """
-        返回 List[PIL.Image] (RGB)。优先 decord，失败用 opencv。
+        Returns List[PIL.Image] (RGB). Prefers decord, falls back to opencv.
         mode:
-        - "all": 读取视频全部帧，不截断，不补齐
-        - "uniform": 在全视频长度上均匀采样 num_frames
-        - "head": 取前 num_frames
+        - "all": read all video frames, no truncation or padding
+        - "uniform": uniformly sample num_frames across the full video
+        - "head": take the first num_frames
         """
         # decord
         try:
@@ -387,7 +360,7 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
         video_col="video",
         prompt_col="caption",
         switch_prompt_col="caption_extend",
-        num_frames=None,                 # 返回的视频帧数
+        num_frames=None,               
         sample_mode="all",         # "uniform" or "head" or "all"
         return_video=True,
         return_image=True,
@@ -413,8 +386,6 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
         self.center_crop = center_crop
         self.random_flip = random_flip
 
-        # 仅做 “crop + flip + toTensor + normalize”
-        # resize 由我们自己做（为了完全复用你现有的 cover-resize 逻辑）
         self.post_processor = transforms.Compose(
             [
                 transforms.CenterCrop((height, width)) if center_crop else transforms.RandomCrop((height, width)),
@@ -428,33 +399,19 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
         return len(self.video_paths)
 
     def __getitem__(self, index):
-        # 用 randint + index 做一个“固定 seed 下可复现”的遍历扰动
-        #data_id = torch.randint(0, len(self.video_paths), (1,))[0]
         data_id = (index) % len(self.video_paths)
 
         video_path = self.video_paths[int(data_id)]
-        # if video_path.startswith("/m2v_intern/xuziyi06/"):
-        #     video_path = video_path.replace(
-        #         "/m2v_intern/xuziyi06/",
-        #         "/m2v_intern/raozejing/xuziyi06/"
-        #     )
-        if video_path.startswith("/share/xuziyi/"):
-            video_path = video_path.replace(
-                "/share/xuziyi/",
-                "/share/raozejing/"
-            )
+       
         text = self.texts[int(data_id)]
         switch_text = self.switch_texts[int(data_id)]
 
         out = {"prompts": text, "switch_prompts": switch_text, "idx": index, "data_id": int(data_id), "video_path": video_path}
 
-        # 先读视频帧（因为 image 可以直接取首帧，避免重复解码）
         frames_pil = None
         if self.return_video:
             frames_pil = self._read_video_frames(video_path, num_frames=self.num_frames, mode=self.sample_mode)
-            # frames_pil: List[PIL.Image]，每帧 RGB
 
-        # image：如果需要就取首帧；如果已经读了 video，直接用 video 的第 0 帧
         if self.return_image:
             if frames_pil is not None and len(frames_pil) > 0:
                 image = frames_pil[0]
@@ -462,7 +419,6 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
                 image = self._read_first_frame(video_path)
             out["images"] = self._process_single_image(image)
 
-        # video：对每一帧做相同 resize + 同一组 crop/flip 逻辑（下面用“参数锁定”保证一致）
         if self.return_video:
             out["frames"] = self._process_video_frames_consistent(frames_pil)
 
@@ -471,7 +427,6 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
     # ---------- processing helpers ----------
 
     def _cover_resize_pil(self, image: Image.Image) -> Image.Image:
-        """完全复用你现在的 cover-resize 逻辑：先 resize 到能覆盖目标 H/W，再 crop。"""
         target_height, target_width = self.height, self.width
         w, h = image.size
         scale = max(target_width / w, target_height / h)
@@ -487,34 +442,23 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
         return image
 
     def _process_video_frames_consistent(self, frames_pil):
-        """
-        关键点：保证 video 内所有帧用同一组 crop 参数、同一次 flip。
-        - resize：每帧独立做 cover-resize（因为原始帧尺寸相同，效果也一致）
-        - crop：如果是 RandomCrop，需要固定同一个 crop 参数
-        - flip：如果是 RandomHorizontalFlip，需要固定同一次 flip 决策
-        """
         if frames_pil is None or len(frames_pil) == 0:
             raise RuntimeError("Empty video frames")
 
-        # 1) cover-resize 每一帧
         frames_resized = [self._cover_resize_pil(im) for im in frames_pil]
 
-        # 2) 决定 crop 参数（CenterCrop 不需要参数）
         if self.center_crop:
             crop_params = None
         else:
-            # RandomCrop.get_params 返回 (i, j, h, w)
             i, j, h, w = transforms.RandomCrop.get_params(
                 frames_resized[0], output_size=(self.height, self.width)
             )
             crop_params = (i, j, h, w)
 
-        # 3) 决定 flip（random_flip=True 才可能 flip）
         do_flip = False
         if self.random_flip:
             do_flip = bool(torch.rand(1).item() < 0.5)
 
-        # 4) 对每帧应用同样的 crop/flip + ToTensor + Normalize
         video_t = []
         for im in frames_resized:
             if crop_params is None:
@@ -557,11 +501,11 @@ class I2V_TwoText_Dataset(torch.utils.data.Dataset):
     @staticmethod
     def _read_video_frames(video_path: str, num_frames: int = None, mode: str = "uniform"):
         """
-        返回 List[PIL.Image] (RGB)。优先 decord，失败用 opencv。
+        Returns List[PIL.Image] (RGB). Prefers decord, falls back to opencv.
         mode:
-        - "all": 读取视频全部帧，不截断，不补齐
-        - "uniform": 在全视频长度上均匀采样 num_frames
-        - "head": 取前 num_frames
+        - "all": read all video frames, no truncation or padding
+        - "uniform": uniformly sample num_frames across the full video
+        - "head": take the first num_frames
         """
         # decord
         try:
@@ -657,7 +601,7 @@ class I2V_Prompts_list_Dataset(torch.utils.data.Dataset):
 
         if self.return_prompts_list:
             if prompts_list_col not in self.df.columns:
-                raise ValueError(f"csv 中不存在列: {prompts_list_col}")
+                raise ValueError(f"Column not found in CSV: {prompts_list_col}")
 
             self.prompts_lists = self.df[prompts_list_col].apply(self._parse_prompts_list).tolist()
         else:
@@ -689,16 +633,7 @@ class I2V_Prompts_list_Dataset(torch.utils.data.Dataset):
         data_id = index % len(self.video_paths)
 
         video_path = self.video_paths[int(data_id)]
-        # if video_path.startswith("/m2v_intern/xuziyi06/"):
-        #     video_path = video_path.replace(
-        #         "/m2v_intern/xuziyi06/",
-        #         "/m2v_intern/raozejing/xuziyi06/"
-        #     )
-        if video_path.startswith("/share/xuziyi/"):
-            video_path = video_path.replace(
-                "/share/xuziyi/",
-                "/share/raozejing/"
-            )
+     
         text = self.texts[int(data_id)]
 
         out = {
@@ -739,10 +674,10 @@ class I2V_Prompts_list_Dataset(torch.utils.data.Dataset):
             x = x.strip()
             value = ast.literal_eval(x)
             if not isinstance(value, list):
-                raise ValueError(f"prompts_list 解析后不是 list: {value}")
+                raise ValueError(f"prompts_list did not parse into a list: {value}")
             return value
 
-        raise ValueError(f"无法解析 prompts_list，类型为: {type(x)}")
+        raise ValueError(f"Cannot parse prompts_list, type: {type(x)}")
 
     def _cover_resize_pil(self, image: Image.Image) -> Image.Image:
         target_height, target_width = self.height, self.width
@@ -817,11 +752,11 @@ class I2V_Prompts_list_Dataset(torch.utils.data.Dataset):
     @staticmethod
     def _read_video_frames(video_path: str, num_frames: int = None, mode: str = "uniform"):
         """
-        返回 List[PIL.Image] (RGB)。优先 decord，失败用 opencv。
+        Returns List[PIL.Image] (RGB). Prefers decord, falls back to opencv.
         mode:
-        - "all": 读取视频全部帧，不截断，不补齐
-        - "uniform": 在全视频长度上均匀采样 num_frames
-        - "head": 取前 num_frames
+        - "all": read all video frames, no truncation or padding
+        - "uniform": uniformly sample num_frames across the full video
+        - "head": take the first num_frames
         """
         # decord
         try:
@@ -916,10 +851,10 @@ class ImageDataset(Dataset):
             self.df = self.df.iloc[:max_items].reset_index(drop=True)
 
         if image_col not in self.df.columns:
-            raise ValueError(f"CSV 中找不到图像字段: {image_col}")
+            raise ValueError(f"Image column not found in CSV: {image_col}")
 
         if prompt_col not in self.df.columns:
-            raise ValueError(f"CSV 中找不到 caption 字段: {prompt_col}")
+            raise ValueError(f"Caption column not found in CSV: {prompt_col}")
 
         self.image_paths = self.df[image_col].tolist()
         self.texts = self.df[prompt_col].fillna("").astype(str).tolist()
@@ -934,9 +869,9 @@ class ImageDataset(Dataset):
 
         if self.return_prompts_list:
             if prompts_list_col is None:
-                raise ValueError("return_prompts_list=True 时必须指定 prompts_list_col")
+                raise ValueError("prompts_list_col must be specified when return_prompts_list=True")
             if prompts_list_col not in self.df.columns:
-                raise ValueError(f"CSV 中找不到 prompts_list 字段: {prompts_list_col}")
+                raise ValueError(f"prompts_list column not found in CSV: {prompts_list_col}")
 
         self.post_processor = transforms.Compose(
             [
@@ -982,18 +917,6 @@ class ImageDataset(Dataset):
         return out
 
     def _fix_path(self, path):
-        # if path.startswith("/m2v_intern/xuziyi06/"):
-        #     path = path.replace(
-        #         "/m2v_intern/xuziyi06/",
-        #         "/m2v_intern/raozejing/xuziyi06/"
-        #     )
-
-        if path.startswith("/share/xuziyi/"):
-            path = path.replace(
-                "/share/xuziyi/",
-                "/share/raozejing/"
-            )
-
         return path
 
     def _cover_resize_pil(self, image: Image.Image) -> Image.Image:

@@ -69,6 +69,14 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+        whether_per_block_temporal_scale = getattr(self.args, "whether_set_per_block_temporal_scale", False)
+        if whether_per_block_temporal_scale:
+            default_scale = getattr(self.args, "default_temporal_scale", 1.0)
+            temporal_scale_per_block = list(getattr(self.args, "temporal_scale_per_block", [default_scale] * self.num_transformer_blocks))
+            self._set_per_block_temporal_scale(temporal_scale_per_block)
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print("[inference] per-block temporal_scale fixed at construction time")
+
     def inference(
         self,
         noise: torch.Tensor,
@@ -77,11 +85,6 @@ class CausalInferencePipeline(torch.nn.Module):
         profile: bool = False,
         low_memory: bool = False,
         initial_latent = False,
-        visualize_sink_attn: bool = False,
-        visualize_cross_attn: bool = False,
-        visualize_local_attn: bool = False,
-        vis_output_dir: str = "vis_sink_attn",
-        sink_frames_rgb: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -107,22 +110,7 @@ class CausalInferencePipeline(torch.nn.Module):
             num_blocks = (num_frames - 1) // self.num_frame_per_block
 
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
-        num_output_frames = num_frames + num_input_frames  # add the initial latent frames
-
-        _causal_model_22_mod.SINK_ATTN_VIS_ENABLED = visualize_sink_attn
-        _causal_model_22_mod.SINK_ATTN_SCORE_BUFFER = []
-        _causal_model_22_mod.SINK_ATTN_CURRENT_CHUNK_ID = 0
-        _causal_model_22_mod.SINK_ATTN_CURRENT_STEP_ID = 0
-        _causal_model_22_mod.SINK_ATTN_CURRENT_BLOCK_ID = 0
-        _causal_model_22_mod.SINK_ATTN_IS_DENOISING = False
-        _causal_model_22_mod.CROSS_ATTN_VIS_ENABLED = visualize_cross_attn
-        _causal_model_22_mod.CROSS_ATTN_SCORE_BUFFER = []
-        _causal_model_22_mod.CROSS_ATTN_CURRENT_BLOCK_ID = 0
-        _causal_model_22_mod.LOCAL_ATTN_VIS_ENABLED = False
-        _causal_model_22_mod.LOCAL_ATTN_SCORE_BUFFER = []
-        _causal_model_22_mod.LOCAL_ATTN_CURRENT_BLOCK_ID = 0
-        if visualize_sink_attn:
-            os.makedirs(vis_output_dir, exist_ok=True)
+        num_output_frames = num_frames + num_input_frames
 
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
@@ -190,7 +178,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self._set_all_modules_max_attention_size(self.local_attn_size)
         self._set_all_modules_sink_size(1)
         target_sink_size = getattr(self.args.model_kwargs, "sink_size", 1)
-        print(f"[inference] sink_size initialized to 1, will switch to {target_sink_size} after first chunk")
+        #print(f"[inference] sink_size initialized to 1, will switch to {target_sink_size} after first chunk")
         if initial_latent is not None:
             timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
             if self.independent_first_frame:
@@ -240,29 +228,15 @@ class CausalInferencePipeline(torch.nn.Module):
         for current_num_frames in tqdm(all_num_frames, desc=f"rank {dist.get_rank() if dist.is_initialized() else 0}"):
             if profile:
                 block_start.record()
-
             if not dist.is_initialized() or dist.get_rank() == 0:
                 sink_sizes = [block.self_attn.sink_size for block in self.generator.model.blocks if hasattr(block.self_attn, "sink_size")]
                 print(f"[chunk {chunk_loop_id:04d}] sink_sizes: {sink_sizes}")
-
-            if visualize_local_attn:
-                _causal_model_22_mod.LOCAL_ATTN_VIS_ENABLED = (chunk_loop_id % 5 == 0 or chunk_loop_id in [1, 2, 3, 4])
-
-            _causal_model_22_mod.SINK_ATTN_VIS_ENABLED = visualize_sink_attn and (chunk_loop_id % 5 == 0 or chunk_loop_id in [1, 2, 3, 4])
-            _causal_model_22_mod.CROSS_ATTN_VIS_ENABLED = visualize_cross_attn and (chunk_loop_id == 0)
 
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
             # Step 2.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
-                if visualize_sink_attn or visualize_cross_attn or visualize_local_attn:
-                    _causal_model_22_mod.SINK_ATTN_CURRENT_STEP_ID = index
-                    _causal_model_22_mod.SINK_ATTN_CURRENT_BLOCK_ID = 0
-                    _causal_model_22_mod.CROSS_ATTN_CURRENT_BLOCK_ID = 0
-                    _causal_model_22_mod.LOCAL_ATTN_CURRENT_BLOCK_ID = 0
-                    _causal_model_22_mod.SINK_ATTN_IS_DENOISING = True
-
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
                     device=noise.device,
@@ -297,8 +271,6 @@ class CausalInferencePipeline(torch.nn.Module):
             # Step 2.2: record the model's output
             output[:, current_start_frame :current_start_frame + current_num_frames] = denoised_pred.to(output.device)
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
-            if visualize_sink_attn or visualize_cross_attn or visualize_local_attn:
-                _causal_model_22_mod.SINK_ATTN_IS_DENOISING = False
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(
                 noisy_image_or_video=denoised_pred,
@@ -308,49 +280,6 @@ class CausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
-
-            if visualize_sink_attn and sink_frames_rgb is not None and (chunk_loop_id % 5 == 0 or chunk_loop_id in [1, 2, 3, 4]):
-                print(f"[vis] chunk={_causal_model_22_mod.SINK_ATTN_CURRENT_CHUNK_ID} buffer_len={len(_causal_model_22_mod.SINK_ATTN_SCORE_BUFFER)} sink_frames_rgb={sink_frames_rgb.shape}")
-                if len(_causal_model_22_mod.SINK_ATTN_SCORE_BUFFER) > 0:
-                    buffer_save_path = os.path.join(vis_output_dir, f"sink_attn_buffer_chunk{chunk_loop_id:02d}.pt")
-                    torch.save(_causal_model_22_mod.SINK_ATTN_SCORE_BUFFER, buffer_save_path)
-                    print(f"[vis] sink attn buffer saved to {buffer_save_path}")
-                # self._save_sink_attn_heatmaps(
-                #     vis_output_dir=vis_output_dir,
-                #     chunk_id=_causal_model_22_mod.SINK_ATTN_CURRENT_CHUNK_ID,
-                #     sink_frames_rgb=sink_frames_rgb,
-                #     frame_h=1280, frame_w=704,
-                #     token_h=40, token_w=22,
-                # )
-                _causal_model_22_mod.SINK_ATTN_SCORE_BUFFER = []
-
-            if visualize_cross_attn and chunk_loop_id == 0:
-                self._save_cross_attn_heatmaps(
-                    vis_output_dir=vis_output_dir,
-                    chunk_id=_causal_model_22_mod.SINK_ATTN_CURRENT_CHUNK_ID,
-                    sink_frames_rgb=sink_frames_rgb,
-                    frame_h=1280, frame_w=704,
-                    token_h=40, token_w=22,
-                )
-                _causal_model_22_mod.CROSS_ATTN_SCORE_BUFFER = []
-
-            if visualize_local_attn and (chunk_loop_id % 5 == 0 or chunk_loop_id in [1, 2, 3, 4]):
-                if len(_causal_model_22_mod.LOCAL_ATTN_SCORE_BUFFER) > 0:
-                    local_buffer_save_path = os.path.join(vis_output_dir, f"local_attn_buffer_chunk{chunk_loop_id:02d}.pt")
-                    torch.save(_causal_model_22_mod.LOCAL_ATTN_SCORE_BUFFER, local_buffer_save_path)
-                    print(f"[vis] local attn buffer saved to {local_buffer_save_path}")
-                # if chunk_loop_id >= 4:
-                #     self._save_local_attn_heatmaps(
-                #         vis_output_dir=vis_output_dir,
-                #         chunk_id=_causal_model_22_mod.SINK_ATTN_CURRENT_CHUNK_ID,
-                #         sink_frames_rgb=sink_frames_rgb,
-                #         frame_h=1280, frame_w=704,
-                #         token_h=40, token_w=22,
-                #     )
-                _causal_model_22_mod.LOCAL_ATTN_SCORE_BUFFER = []
-
-            if visualize_sink_attn or visualize_cross_attn or visualize_local_attn:
-                _causal_model_22_mod.SINK_ATTN_CURRENT_CHUNK_ID += 1
 
             chunk_loop_id += 1
 
@@ -366,17 +295,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 else:
                     self._set_all_modules_sink_size(target_sink_size)
 
-                whether_per_block_temporal_scale = getattr(self.args, "whether_set_per_block_temporal_scale", False)
-                if whether_per_block_temporal_scale:
-                    default_scale = getattr(self.args, "default_temporal_scale", 1.0)
-                    temporal_scale_per_block = list(getattr(self.args, "temporal_scale_per_block", [default_scale] * self.num_transformer_blocks))
-                    self._set_per_block_temporal_scale(temporal_scale_per_block)
+                # NOTE: temporal_scale is fixed at construction time, so we
+                # intentionally do NOT switch it here after the first chunk.
 
                 first_chunk_done = True
                 if not dist.is_initialized() or dist.get_rank() == 0:
                     print(f"[inference] sink_size switched after first chunk (per_block={whether_per_block})")
-                    if whether_per_block_temporal_scale:
-                        print(f"[inference] temporal_scale set per block")
 
             if profile:
                 block_end.record()
@@ -396,7 +320,7 @@ class CausalInferencePipeline(torch.nn.Module):
             vae_start.record()
 
         # Step 3: Decode the output
-        # if getattr(self.args.model_kwargs, "use_infinite_attention", False):
+        # if getattr(self.args.model_kwargs, "MDS_with_relativeRope", False):
         #     video = self.vae.decode_to_pixel_chunk(output.to(noise.device), use_cache=False)
         # else:
         #     video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
@@ -535,207 +459,6 @@ class CausalInferencePipeline(torch.nn.Module):
                 block.self_attn.temporal_scale = float(s)
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"[inference] per-block temporal_scale set: {temporal_scale_per_block}")
-
-    def _save_sink_attn_heatmaps(self, vis_output_dir, chunk_id, sink_frames_rgb,
-                                  frame_h=1280, frame_w=704, token_h=80, token_w=44):
-        import torch.nn.functional as F
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            import matplotlib.cm as cm
-        except ImportError:
-            print("[vis] matplotlib not available, skipping heatmap save")
-            return
-
-        buffer = _causal_model_22_mod.SINK_ATTN_SCORE_BUFFER
-        if len(buffer) == 0:
-            return
-
-        for sink_idx in range(1):
-            if sink_frames_rgb is not None:
-                sink_rgb = sink_frames_rgb[0]
-                if sink_rgb.shape[0] == 3:
-                    sink_rgb = sink_rgb.permute(1, 2, 0)
-                sink_rgb = sink_rgb.float().cpu()
-                if sink_rgb.min() < 0.0:
-                    sink_rgb = (sink_rgb + 1.0) / 2.0
-                elif sink_rgb.max() > 1.0:
-                    sink_rgb = sink_rgb / 255.0
-            else:
-                sink_rgb = None
-
-            for entry in buffer:
-                step_id = entry["denoise_step_id"]
-                block_id = entry["block_id"]
-                score = entry["score"][0].detach().cpu()
-
-                num_query_tokens = score.shape[0]
-                num_query_frames = num_query_tokens // (token_h * token_w)
-                if num_query_frames == 0:
-                    continue
-
-                # score: (num_query_tokens, sink_total_tokens)
-                # For each query token at spatial position (h,w), take the score against
-                # the corresponding sink token at the same (h,w) position.
-                # This removes RoPE cross-position bias introduced by averaging over all sink tokens.
-                first_frame_sink_tokens = token_h * token_w
-                score_query = score[:num_query_frames * token_h * token_w, :first_frame_sink_tokens]
-                # score_query: (num_query_frames * token_h * token_w, token_h * token_w)
-                # diagonal: score of each query token against its spatially corresponding sink token
-                sink_pos = torch.arange(first_frame_sink_tokens)
-                query_pos = sink_pos.unsqueeze(0).expand(num_query_frames, -1).reshape(-1)  # repeat for each query frame
-                score_first_sink = score_query[torch.arange(num_query_frames * token_h * token_w), query_pos]  # (num_query_tokens,)
-                score_spatial = score_first_sink.reshape(num_query_frames, token_h, token_w)
-                score_avg = score_spatial.mean(dim=0)
-
-                heatmap = score_avg.unsqueeze(0).unsqueeze(0).float()
-                heatmap = F.interpolate(heatmap, size=(frame_h, frame_w), mode="bilinear", align_corners=False)
-                heatmap = heatmap.squeeze().numpy()
-                heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-
-                fig, ax = plt.subplots(1, 1, figsize=(frame_w / 100, frame_h / 100), dpi=100)
-                if sink_rgb is not None:
-                    ax.imshow(sink_rgb.numpy())
-                ax.imshow(heatmap, cmap="jet", alpha=0.5)
-                ax.axis("off")
-
-                rank_id = dist.get_rank() if dist.is_initialized() else 0
-                save_path = os.path.join(
-                    vis_output_dir,
-                    f"rank{rank_id:02d}_chunk{chunk_id:04d}_step{step_id:02d}_block{block_id:02d}_sink{sink_idx:02d}.png"
-                )
-                plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
-                plt.close(fig)
-
-    def _save_cross_attn_heatmaps(self, vis_output_dir, chunk_id, sink_frames_rgb,
-                                   frame_h=1280, frame_w=704, token_h=40, token_w=22):
-        import torch.nn.functional as F
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-        except ImportError:
-            print("[vis] matplotlib not available, skipping cross attn heatmap save")
-            return
-
-        buffer = _causal_model_22_mod.CROSS_ATTN_SCORE_BUFFER
-        if len(buffer) == 0:
-            return
-
-        if sink_frames_rgb is not None:
-            sink_rgb = sink_frames_rgb[0]
-            if sink_rgb.shape[0] == 3:
-                sink_rgb = sink_rgb.permute(1, 2, 0)
-            sink_rgb = sink_rgb.float().cpu()
-            if sink_rgb.min() < 0.0:
-                sink_rgb = (sink_rgb + 1.0) / 2.0
-            elif sink_rgb.max() > 1.0:
-                sink_rgb = sink_rgb / 255.0
-        else:
-            sink_rgb = None
-
-        rank_id = dist.get_rank() if dist.is_initialized() else 0
-
-        for entry in buffer:
-            step_id = entry["denoise_step_id"]
-            block_id = entry["block_id"]
-            score = entry["score"][0].detach().cpu()  # (num_query_tokens, text_len)
-
-            num_query_tokens = score.shape[0]
-            num_query_frames = num_query_tokens // (token_h * token_w)
-            if num_query_frames == 0:
-                continue
-
-            score_spatial = score[:num_query_frames * token_h * token_w]  # (num_query_tokens, text_len)
-
-            # max pooling over text tokens: each video token takes its most attended text token
-            score_max, _ = score_spatial.max(dim=-1)  # (num_query_tokens,)
-            score_map = score_max.reshape(num_query_frames, token_h, token_w).mean(dim=0)  # (token_h, token_w)
-
-            heatmap = score_map.unsqueeze(0).unsqueeze(0).float()
-            heatmap = F.interpolate(heatmap, size=(frame_h, frame_w), mode="bilinear", align_corners=False)
-            heatmap = heatmap.squeeze().numpy()
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-
-            fig, ax = plt.subplots(1, 1, figsize=(frame_w / 100, frame_h / 100), dpi=100)
-            if sink_rgb is not None:
-                ax.imshow(sink_rgb.numpy())
-            ax.imshow(heatmap, cmap="jet", alpha=0.5)
-            ax.axis("off")
-
-            save_path = os.path.join(
-                vis_output_dir,
-                f"rank{rank_id:02d}_chunk{chunk_id:04d}_step{step_id:02d}_block{block_id:02d}_cross.png"
-            )
-            plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
-            plt.close(fig)
-
-    def _save_local_attn_heatmaps(self, vis_output_dir, chunk_id, sink_frames_rgb,
-                                   frame_h=1280, frame_w=704, token_h=40, token_w=22):
-        import torch.nn.functional as F
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-        except ImportError:
-            print("[vis] matplotlib not available, skipping local attn heatmap save")
-            return
-
-        buffer = _causal_model_22_mod.LOCAL_ATTN_SCORE_BUFFER
-        if len(buffer) == 0:
-            return
-
-        if sink_frames_rgb is not None:
-            sink_rgb = sink_frames_rgb[0]
-            if sink_rgb.shape[0] == 3:
-                sink_rgb = sink_rgb.permute(1, 2, 0)
-            sink_rgb = sink_rgb.float().cpu()
-            if sink_rgb.min() < 0.0:
-                sink_rgb = (sink_rgb + 1.0) / 2.0
-            elif sink_rgb.max() > 1.0:
-                sink_rgb = sink_rgb / 255.0
-        else:
-            sink_rgb = None
-
-        rank_id = dist.get_rank() if dist.is_initialized() else 0
-
-        for entry in buffer:
-            step_id = entry["denoise_step_id"]
-            block_id = entry["block_id"]
-            score = entry["score"][0].detach().cpu()  # (num_query_tokens, last4_tokens)
-
-            num_query_tokens = score.shape[0]
-            num_query_frames = num_query_tokens // (token_h * token_w)
-            if num_query_frames == 0:
-                continue
-
-            # last 1 frame has token_h*token_w tokens, use diagonal (same spatial position) to remove RoPE bias
-            spatial_tokens = token_h * token_w
-            score_q = score[:num_query_frames * spatial_tokens, :spatial_tokens]
-            diag_pos = torch.arange(spatial_tokens).unsqueeze(0).expand(num_query_frames, -1).reshape(-1)
-            score_diag = score_q[torch.arange(num_query_frames * spatial_tokens), diag_pos]
-            score_map = score_diag.reshape(num_query_frames, token_h, token_w).mean(dim=0)
-
-            heatmap = score_map.unsqueeze(0).unsqueeze(0).float()
-            heatmap = F.interpolate(heatmap, size=(frame_h, frame_w), mode="bilinear", align_corners=False)
-            heatmap = heatmap.squeeze().numpy()
-            import numpy as np
-            heatmap = np.log1p(heatmap - heatmap.min())
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-
-            fig, ax = plt.subplots(1, 1, figsize=(frame_w / 100, frame_h / 100), dpi=100)
-            if sink_rgb is not None:
-                ax.imshow(sink_rgb.numpy())
-            ax.imshow(heatmap, cmap="jet", alpha=0.5)
-            ax.axis("off")
-
-            save_path = os.path.join(
-                vis_output_dir,
-                f"rank{rank_id:02d}_chunk{chunk_id:04d}_step{step_id:02d}_block{block_id:02d}_local.png"
-            )
-            plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
-            plt.close(fig)
 
     def clear_kv_cache(self):
         """
