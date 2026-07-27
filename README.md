@@ -118,4 +118,4 @@ If StreamHOI is useful for your research, please cite:
 
 ## Acknowledgements
 
-StreamHOI builds on open research from [Causal Forcing](https://github.com/thu-ml/Causal-Forcing), [Longlive](https://github.com/NVlabs/LongLive) and [Wan2.2](https://github.com/Wan-Video/Wan2.2).
+StreamHOI builds on open research from [Self forcing](https://github.com/guandeh17/Self-Forcing), [Causal Forcing](https://github.com/thu-ml/Causal-Forcing), [Longlive](https://github.com/NVlabs/LongLive) and [Wan2.2](https://github.com/Wan-Video/Wan2.2).
