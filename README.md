@@ -45,7 +45,7 @@ This downloads:
 | Repo | Used as |
 | --- | --- |
 | [`Wan-AI/Wan2.2-II2V-5B`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B) | Wan2.2-TI2V backbone for video generation |
-| [`KlingTeam/StreamHOI`](https://huggingface.co/KlingTeam) | StreamHOI checkpoints, including `streamhoi_model.pt, streamhoi_lora.pt` |
+| [`KlingTeam/StreamHOI`](https://huggingface.co/KlingTeam/StreamHOI) | StreamHOI checkpoints, including `streamhoi_model.pt, streamhoi_lora.pt` |
 
 The default layout is:
 
