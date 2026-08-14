@@ -1,12 +1,36 @@
-# StreamHOI
+<h1 align="center">StreamHOI: Interaction-aware Temporal Context Adaptation for Streaming HOI Video Synthesis</h1>
 
-<div align="left">
+<div align='center'>
+    <a href='' target='_blank'><strong>Zejing Rao</strong></a><sup>1,*</sup>&emsp;
+    <a href='' target='_blank'><strong>Haoxian Zhang</strong></a><sup>2</sup>&emsp;
+    <a href='' target='_blank'><strong>Xiaoqiang Liu</strong></a><sup>2</sup>&emsp;
+    <a href='' target='_blank'><strong>Yiping Meng</strong></a><sup>2</sup>&emsp;
+    <a href='' target='_blank'><strong>Guoxin Zhang</strong></a><sup>2</sup>&emsp;
+</div>
 
+<div align='center'>
+    <a href='' target='_blank'><strong>Pengfei Wan</strong></a><sup>2</sup>&emsp;
+    <a href='https://scholar.google.com/citations?user=PdKElfwAAAAJ&hl=zh-CN' target='_blank'><strong>Fan Tang</strong></a><sup>1,&#9993;</sup>&emsp;
+    <a href='' target='_blank'><strong>Tong-Yee Lee</strong></a><sup>3</sup>&emsp;
+</div>
+
+<div align='center'>
+    <sup>1</sup> University of Chinese Academy of Sciences &emsp;
+    <sup>2</sup> Kling AI Research &emsp;
+    <sup>3</sup> National Cheng Kung University
+</div>
+
+<div align='center'>
+    <small><sup>*</sup> Work done during internship at Kling AI Research</small>&emsp;
+    <small><sup>&#9993;</sup> Corresponding author</small>
+</div>
+
+<br>
+
+<div align="center">
 
 [![arXiv](https://img.shields.io/badge/arXiv-2607.20174-b31b1b)](https://arxiv.org/abs/2607.20174)
 [![Model](https://img.shields.io/badge/Model-HuggingFace-F9D648)](https://huggingface.co/KlingTeam)
-
-
 
 </div>
 
