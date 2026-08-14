@@ -40,7 +40,7 @@
 
 <p align="center">
   <a href="https://www.youtube.com/watch?v=4fRkF5ajlKw">
-    <img src="assets/StreamHOI-first-frame.png" width="80%" alt="StreamHOI demo video">
+    <img src="assets/demo-github-first-frame.jpg" width="80%" alt="StreamHOI demo video">
   </a>
 </p>
 
