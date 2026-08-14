@@ -36,6 +36,7 @@
 
 **StreamHOI** is a low-latency streaming framework designed for long-duration Human-Object Interaction (HOI) video generation. While existing models rely on offline pipelines or compute-intensive frame-chaining, StreamHOI enables real-time generation (17.6 FPS) by optimizing how historical memory is structured within diffusion transformers to preserve long-term interaction consistency.
 
+
 ## Video Demo
 
 <p align="center">
