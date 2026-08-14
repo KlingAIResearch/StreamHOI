@@ -1,7 +1,7 @@
 <h1 align="center">StreamHOI: Interaction-aware Temporal Context Adaptation for Streaming HOI Video Synthesis</h1>
 
 <div align='center'>
-    <a href='' target='_blank'><strong>Zejing Rao</strong></a><sup>1,*</sup>&emsp;
+    <a href='https://scholar.google.com/citations?user=8Fa9i4QAAAAJ&hl=en' target='_blank'><strong>Zejing Rao</strong></a><sup>1,*</sup>&emsp;
     <a href='' target='_blank'><strong>Haoxian Zhang</strong></a><sup>2</sup>&emsp;
     <a href='' target='_blank'><strong>Xiaoqiang Liu</strong></a><sup>2</sup>&emsp;
     <a href='' target='_blank'><strong>Yiping Meng</strong></a><sup>2</sup>&emsp;
